@@ -1,12 +1,10 @@
 # app.py
 """
-Language Mapper - Streamlit + Folium (robust REST Countries handling)
-
+Language Mapper - Streamlit + Folium (tile attribution fix + robust REST fallback)
 Run:
 pip install -r requirements.txt
 streamlit run app.py
 """
-
 import streamlit as st
 import requests
 import folium
@@ -22,11 +20,10 @@ st.markdown("Click a country to view official languages and metadata. Data sourc
 
 # ----- Config -----
 GEOJSON_URL = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
-# initial (preferred) filtered URL; fallback will be plain /all
 REST_ALL_BASE = "https://restcountries.com/v3.1/all"
 REST_ALL_FIELDS = "name,cca3,languages,latlng,flags,capital,region,subregion,population,currencies,timezones"
 
-# ----- Caching network calls -----
+# ----- Network helpers -----
 @lru_cache(maxsize=1)
 def fetch_geojson(url):
     r = requests.get(url, timeout=30)
@@ -34,35 +31,20 @@ def fetch_geojson(url):
     return r.json()
 
 def fetch_rest_all_with_fallback(base_url, fields):
-    """
-    Try /all?fields=... first. If it fails (HTTPError or other),
-    retry /all without fields and return the full list.
-    Returns list (possibly empty) and a message (None on success or info/warning).
-    """
-    # attempt 1: filtered
+    """Try filtered request first, then unfiltered, return (list, message_or_None)."""
     filtered_url = f"{base_url}?fields={fields}"
     try:
         r = requests.get(filtered_url, timeout=30)
         r.raise_for_status()
         return r.json(), None
-    except requests.HTTPError as e:
-        # API rejected the filtered request (400/4xx/5xx). We'll retry without fields.
-        msg = f"REST Countries filtered request failed ({r.status_code if 'r' in locals() else 'HTTPError'}). Retrying without fields."
+    except Exception as e_filtered:
+        # try unfiltered
         try:
             r2 = requests.get(base_url, timeout=30)
             r2.raise_for_status()
-            return r2.json(), msg  # return full dataset with informational message
+            return r2.json(), f"Filtered REST request failed; using unfiltered full payload."
         except Exception as e2:
-            # both attempts failed
-            return [], f"Failed to fetch REST Countries data: {str(e2)}"
-    except Exception as e:
-        # network or other error; try unfiltered
-        try:
-            r2 = requests.get(base_url, timeout=30)
-            r2.raise_for_status()
-            return r2.json(), f"Filtered request error ({str(e)}); used unfiltered fallback."
-        except Exception as e2:
-            return [], f"Failed to fetch REST Countries data: {str(e2)}"
+            return [], f"Failed to fetch REST Countries data: {e2}"
 
 # ----- Utilities -----
 def extract_iso3(props):
@@ -88,22 +70,19 @@ def bbox_to_string(bounds):
     minx, miny, maxx, maxy = bounds
     return f"SW: {round(miny,4)},{round(minx,4)} • NE: {round(maxy,4)},{round(maxx,4)}"
 
-# ----- Prepare data -----
+# ----- Load data -----
 try:
     geojson = fetch_geojson(GEOJSON_URL)
 except Exception as e:
     st.error(f"Could not load country GeoJSON: {e}")
     st.stop()
 
-# fetch REST Countries with fallback
 rest_all, rest_msg = fetch_rest_all_with_fallback(REST_ALL_BASE, REST_ALL_FIELDS)
 if rest_msg:
-    # show as info/warning for transparency
     st.warning(rest_msg)
 if not rest_all:
     st.error("REST Countries data unavailable — app will continue but some metadata may be missing.")
 
-# build lookup maps from whatever data we have
 rest_by_cca3 = {}
 rest_by_name_lower = {}
 for item in rest_all:
@@ -114,7 +93,6 @@ for item in rest_all:
     if common:
         rest_by_name_lower[common.lower()] = item
 
-# default equal-area transformer
 def get_transformer():
     for tgt in ("EPSG:6933", "ESRI:54009", "EPSG:3857"):
         try:
@@ -127,25 +105,56 @@ def get_transformer():
 
 transformer, used_crs = get_transformer()
 
-# ----- Build Folium map -----
+# ----- Build map -----
 center = [20, 0]
 zoom_start = 2
 m = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap", control_scale=True)
 
-# Add basemap options
-folium.TileLayer('CartoDB positron', name='Light').add_to(m)
-folium.TileLayer('Stamen Terrain', name='Terrain').add_to(m)
-folium.TileLayer('Esri.WorldImagery', name='Satellite').add_to(m)
+# Add extra basemaps with explicit attribution (required by Folium for custom tiles)
+# Wrapped in try/except to avoid hard failures in restrictive environments.
+try:
+    # CartoDB Positron (Carto & OSM attribution)
+    folium.TileLayer(
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        attr="&copy; OpenStreetMap contributors &copy; CARTO",
+        name="Light (Carto)",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+except Exception as e:
+    st.info(f"Carto light basemap not available: {e}")
 
-# Feature loop (attach popups using whatever REST data we have)
+try:
+    # Stamen Terrain (Stamen attribution)
+    folium.TileLayer(
+        tiles="https://stamen-tiles-{s}.a.ssl.fastly.net/terrain/{z}/{x}/{y}.jpg",
+        attr="Map tiles by Stamen Design, under CC BY 3.0. Data by OpenStreetMap, under ODbL.",
+        name="Terrain (Stamen)",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+except Exception as e:
+    st.info(f"Stamen Terrain basemap not available: {e}")
+
+try:
+    # Esri World Imagery
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri",
+        name="Satellite (Esri)",
+        overlay=False,
+        control=True,
+    ).add_to(m)
+except Exception as e:
+    st.info(f"Esri basemap not available: {e}")
+
+# ----- Attach GeoJSON features with popups -----
 for feature in geojson["features"]:
     props = feature.get("properties", {}) or {}
     iso3 = extract_iso3(props)
     rest_obj = None
-
     if iso3 and rest_by_cca3:
         rest_obj = rest_by_cca3.get(str(iso3).upper())
-
     if not rest_obj and rest_by_name_lower:
         geo_name = (props.get("ADMIN") or props.get("NAME") or props.get("name") or "").strip()
         if geo_name:
