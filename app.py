@@ -1,14 +1,6 @@
 # app.py
 """
-Language Mapper - Streamlit + Folium
-
-Features:
-- Click any country polygon to open a popup with:
-  flag, capital, region, population, currencies, timezones, centroid coords,
-  area (sq.km), bounding box.
-- Server-side prefetch of REST Countries (single /all request).
-- Uses Shapely + PyProj for area and centroid calculations.
-- Embeds Folium HTML using st.components.v1.html to avoid st_folium render issues.
+Language Mapper - Streamlit + Folium (robust REST Countries handling)
 
 Run:
 pip install -r requirements.txt
@@ -24,16 +16,15 @@ from shapely.geometry import shape
 from shapely.ops import transform as shapely_transform
 from pyproj import Transformer
 
-# ----- Config -----
 st.set_page_config(page_title="Language Mapper", layout="wide")
 st.title("Language Mapper")
 st.markdown("Click a country to view official languages and metadata. Data sources: REST Countries • Natural Earth GeoJSON.")
 
-# URLs
+# ----- Config -----
 GEOJSON_URL = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
-REST_ALL_URL = (
-    "https://restcountries.com/v3.1/all?fields=name,cca3,languages,latlng,flags,capital,region,subregion,population,currencies,timezones"
-)
+# initial (preferred) filtered URL; fallback will be plain /all
+REST_ALL_BASE = "https://restcountries.com/v3.1/all"
+REST_ALL_FIELDS = "name,cca3,languages,latlng,flags,capital,region,subregion,population,currencies,timezones"
 
 # ----- Caching network calls -----
 @lru_cache(maxsize=1)
@@ -42,11 +33,36 @@ def fetch_geojson(url):
     r.raise_for_status()
     return r.json()
 
-@lru_cache(maxsize=1)
-def fetch_rest_all(url):
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def fetch_rest_all_with_fallback(base_url, fields):
+    """
+    Try /all?fields=... first. If it fails (HTTPError or other),
+    retry /all without fields and return the full list.
+    Returns list (possibly empty) and a message (None on success or info/warning).
+    """
+    # attempt 1: filtered
+    filtered_url = f"{base_url}?fields={fields}"
+    try:
+        r = requests.get(filtered_url, timeout=30)
+        r.raise_for_status()
+        return r.json(), None
+    except requests.HTTPError as e:
+        # API rejected the filtered request (400/4xx/5xx). We'll retry without fields.
+        msg = f"REST Countries filtered request failed ({r.status_code if 'r' in locals() else 'HTTPError'}). Retrying without fields."
+        try:
+            r2 = requests.get(base_url, timeout=30)
+            r2.raise_for_status()
+            return r2.json(), msg  # return full dataset with informational message
+        except Exception as e2:
+            # both attempts failed
+            return [], f"Failed to fetch REST Countries data: {str(e2)}"
+    except Exception as e:
+        # network or other error; try unfiltered
+        try:
+            r2 = requests.get(base_url, timeout=30)
+            r2.raise_for_status()
+            return r2.json(), f"Filtered request error ({str(e)}); used unfiltered fallback."
+        except Exception as e2:
+            return [], f"Failed to fetch REST Countries data: {str(e2)}"
 
 # ----- Utilities -----
 def extract_iso3(props):
@@ -69,15 +85,25 @@ def fmt_num(n):
         return safe_str(n)
 
 def bbox_to_string(bounds):
-    # bounds is (minx, miny, maxx, maxy) -> lon/lat
     minx, miny, maxx, maxy = bounds
     return f"SW: {round(miny,4)},{round(minx,4)} • NE: {round(maxy,4)},{round(maxx,4)}"
 
 # ----- Prepare data -----
-geojson = fetch_geojson(GEOJSON_URL)
-rest_all = fetch_rest_all(REST_ALL_URL)
+try:
+    geojson = fetch_geojson(GEOJSON_URL)
+except Exception as e:
+    st.error(f"Could not load country GeoJSON: {e}")
+    st.stop()
 
-# build lookup maps
+# fetch REST Countries with fallback
+rest_all, rest_msg = fetch_rest_all_with_fallback(REST_ALL_BASE, REST_ALL_FIELDS)
+if rest_msg:
+    # show as info/warning for transparency
+    st.warning(rest_msg)
+if not rest_all:
+    st.error("REST Countries data unavailable — app will continue but some metadata may be missing.")
+
+# build lookup maps from whatever data we have
 rest_by_cca3 = {}
 rest_by_name_lower = {}
 for item in rest_all:
@@ -88,17 +114,15 @@ for item in rest_all:
     if common:
         rest_by_name_lower[common.lower()] = item
 
-# Default equal-area transformer pref (try EPSG:6933, fallback to Mollweide ESRI:54009, then EPSG:3857)
+# default equal-area transformer
 def get_transformer():
     for tgt in ("EPSG:6933", "ESRI:54009", "EPSG:3857"):
         try:
             transformer = Transformer.from_crs("EPSG:4326", tgt, always_xy=True)
-            # quick test transform
             transformer.transform(0, 0)
             return transformer, tgt
         except Exception:
             continue
-    # last resort
     return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True), "EPSG:3857"
 
 transformer, used_crs = get_transformer()
@@ -108,34 +132,30 @@ center = [20, 0]
 zoom_start = 2
 m = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap", control_scale=True)
 
-# Add a few basemap options
+# Add basemap options
 folium.TileLayer('CartoDB positron', name='Light').add_to(m)
 folium.TileLayer('Stamen Terrain', name='Terrain').add_to(m)
 folium.TileLayer('Esri.WorldImagery', name='Satellite').add_to(m)
 
-# Feature loop
+# Feature loop (attach popups using whatever REST data we have)
 for feature in geojson["features"]:
     props = feature.get("properties", {}) or {}
     iso3 = extract_iso3(props)
     rest_obj = None
 
-    # try iso3 lookup first
-    if iso3:
+    if iso3 and rest_by_cca3:
         rest_obj = rest_by_cca3.get(str(iso3).upper())
 
-    # fallback by administrative name
-    if not rest_obj:
+    if not rest_obj and rest_by_name_lower:
         geo_name = (props.get("ADMIN") or props.get("NAME") or props.get("name") or "").strip()
         if geo_name:
             rest_obj = rest_by_name_lower.get(geo_name.lower())
             if not rest_obj:
-                # partial match fallback
                 for nm, obj in rest_by_name_lower.items():
                     if geo_name.lower() in nm:
                         rest_obj = obj
                         break
 
-    # display name & basic fields
     display_name = rest_obj.get("name", {}).get("common") if rest_obj else (props.get("ADMIN") or props.get("NAME") or props.get("name") or "Country")
     iso3_display = rest_obj.get("cca3") if rest_obj else (iso3 or "—")
     capital = ", ".join(rest_obj.get("capital")) if rest_obj and rest_obj.get("capital") else "—"
@@ -148,50 +168,39 @@ for feature in geojson["features"]:
             name = info.get("name")
             currencies.append(f"{name} ({code})" if name else code)
     timezones = rest_obj.get("timezones") if rest_obj else []
-
-    # languages
     languages = []
     if rest_obj and rest_obj.get("languages"):
         languages = list(rest_obj["languages"].values())
-
-    # flags
     flag_png = None
     if rest_obj and rest_obj.get("flags"):
-        # restcountries exposes flags {png, svg}
         flag_png = rest_obj["flags"].get("png") or rest_obj["flags"].get("svg")
 
-    # geometry analytics: area, centroid, bounds
+    # geometry analytics
     geom = feature.get("geometry")
     area_sqkm = "—"
     centroid_lat = centroid_lon = "—"
     bbox_str = "—"
     try:
         poly = shape(geom)
-        # compute centroid lat/lon (in degrees)
         centroid = poly.centroid
         centroid_lon = round(centroid.x, 6)
         centroid_lat = round(centroid.y, 6)
-        bounds = poly.bounds  # (minx, miny, maxx, maxy)
+        bounds = poly.bounds
         bbox_str = bbox_to_string(bounds)
-
-        # project to equal-area and compute area
         try:
             projected = shapely_transform(transformer.transform, poly)
             area_m2 = projected.area
             area_sqkm = round(area_m2 / 1e6, 2)
         except Exception:
-            # fallback: compute geodesic approx via WebMercator if transform fails
             fallback_transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
             proj2 = shapely_transform(fallback_transformer.transform, poly)
             area_m2 = proj2.area
             area_sqkm = round(area_m2 / 1e6, 2)
-    except Exception as e:
-        # keep defaults
+    except Exception:
         area_sqkm = "—"
         centroid_lat = centroid_lon = "—"
         bbox_str = "—"
 
-    # build popup HTML (compact and readable)
     languages_html = ", ".join(languages) if languages else "—"
     currencies_html = ", ".join(currencies) if currencies else "—"
     timezones_html = ", ".join(timezones) if timezones else "—"
@@ -223,7 +232,6 @@ for feature in geojson["features"]:
     </div>
     """
 
-    # add feature with popup
     gj = folium.GeoJson(
         feature,
         style_function=lambda feat, stroke="#2b4a90", fill="#eaf2ff": {
@@ -237,13 +245,10 @@ for feature in geojson["features"]:
     gj.add_child(folium.Popup(popup_html, max_width=360))
     gj.add_to(m)
 
-# Add layer control
 folium.LayerControl(position='topright').add_to(m)
 
-# render and embed
 map_html = m.get_root().render()
 components.v1.html(map_html, height=760, scrolling=True)
 
-# small footer
 st.markdown("---")
 st.markdown(f"Note: area computed by projecting to {used_crs} (equal-area preference). Values are approximate.")
