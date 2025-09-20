@@ -1,5 +1,5 @@
-streamlit
-pyproj
-pandas
-folium
-streamlit-folium
+streamlit>=1.20.0
+folium>=0.14.0
+requests>=2.28.0
+shapely>=2.0.0
+pyproj>=3.5.0
