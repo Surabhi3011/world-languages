@@ -1,136 +1,249 @@
 # app.py
+"""
+Language Mapper - Streamlit + Folium
+
+Features:
+- Click any country polygon to open a popup with:
+  flag, capital, region, population, currencies, timezones, centroid coords,
+  area (sq.km), bounding box.
+- Server-side prefetch of REST Countries (single /all request).
+- Uses Shapely + PyProj for area and centroid calculations.
+- Embeds Folium HTML using st.components.v1.html to avoid st_folium render issues.
+
+Run:
+pip install -r requirements.txt
+streamlit run app.py
+"""
+
 import streamlit as st
 import requests
 import folium
-import json
 from streamlit import components
 from functools import lru_cache
+from shapely.geometry import shape
+from shapely.ops import transform as shapely_transform
+from pyproj import Transformer
 
+# ----- Config -----
 st.set_page_config(page_title="Language Mapper", layout="wide")
 st.title("Language Mapper")
-st.markdown("Click a country to view official languages. Data: REST Countries • Natural Earth GeoJSON.")
+st.markdown("Click a country to view official languages and metadata. Data sources: REST Countries • Natural Earth GeoJSON.")
 
-# Config
+# URLs
 GEOJSON_URL = "https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson"
-REST_ALL_URL = "https://restcountries.com/v3.1/all?fields=name,cca3,languages,latlng"
+REST_ALL_URL = (
+    "https://restcountries.com/v3.1/all?fields=name,cca3,languages,latlng,flags,capital,region,subregion,population,currencies,timezones"
+)
 
-# Caching network calls
+# ----- Caching network calls -----
 @lru_cache(maxsize=1)
 def fetch_geojson(url):
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
 @lru_cache(maxsize=1)
 def fetch_rest_all(url):
-    r = requests.get(url, timeout=20)
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# Utility: get ISO3 candidates from GeoJSON props
+# ----- Utilities -----
 def extract_iso3(props):
     if not props:
         return None
-    for k in ("ISO_A3","ISO3","iso_a3","ADM0_A3","adm0_a3","CCA3","cca3","ISO_A3_EH"):
+    keys = ("ISO_A3","ISO3","iso_a3","ADM0_A3","adm0_a3","CCA3","cca3","ISO_A3_EH")
+    for k in keys:
         v = props.get(k)
         if v and v != "-99":
             return v
     return None
 
-# Prepare data
+def safe_str(x):
+    return str(x) if x is not None else "—"
+
+def fmt_num(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return safe_str(n)
+
+def bbox_to_string(bounds):
+    # bounds is (minx, miny, maxx, maxy) -> lon/lat
+    minx, miny, maxx, maxy = bounds
+    return f"SW: {round(miny,4)},{round(minx,4)} • NE: {round(maxy,4)},{round(maxx,4)}"
+
+# ----- Prepare data -----
 geojson = fetch_geojson(GEOJSON_URL)
 rest_all = fetch_rest_all(REST_ALL_URL)
 
-# Build mapping: cca3 -> rest entry (lowercase keys)
+# build lookup maps
 rest_by_cca3 = {}
-rest_by_name = {}
+rest_by_name_lower = {}
 for item in rest_all:
     cca3 = item.get("cca3")
     if cca3:
         rest_by_cca3[cca3.upper()] = item
-    # store common + official names lowercase for fallback matching
-    name_common = item.get("name", {}).get("common")
-    if name_common:
-        rest_by_name[name_common.lower()] = item
+    common = item.get("name", {}).get("common")
+    if common:
+        rest_by_name_lower[common.lower()] = item
 
-# Sidebar search
-st.sidebar.header("Search")
-q = st.sidebar.text_input("Country name (exact or partial)")
-if st.sidebar.button("Go"):
-    st.session_state._search_q = q.strip()
+# Default equal-area transformer pref (try EPSG:6933, fallback to Mollweide ESRI:54009, then EPSG:3857)
+def get_transformer():
+    for tgt in ("EPSG:6933", "ESRI:54009", "EPSG:3857"):
+        try:
+            transformer = Transformer.from_crs("EPSG:4326", tgt, always_xy=True)
+            # quick test transform
+            transformer.transform(0, 0)
+            return transformer, tgt
+        except Exception:
+            continue
+    # last resort
+    return Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True), "EPSG:3857"
 
-# Build folium map — center depends on search if found
+transformer, used_crs = get_transformer()
+
+# ----- Build Folium map -----
 center = [20, 0]
 zoom_start = 2
-search_target = None
-if "_search_q" in st.session_state and st.session_state._search_q:
-    qval = st.session_state._search_q.lower()
-    candidate = None
-    # try exact name match first in rest_by_name
-    if qval in rest_by_name:
-        candidate = rest_by_name[qval]
-    else:
-        # partial match: find first name containing q
-        for name, obj in rest_by_name.items():
-            if qval in name:
-                candidate = obj
-                break
-    if candidate:
-        latlng = candidate.get("latlng")
-        if latlng and len(latlng) == 2:
-            center = latlng
-            zoom_start = 4
-            search_target = candidate.get("name", {}).get("common")
-    # clear search to avoid repeated runs
-    st.session_state._search_q = ""
-
 m = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap", control_scale=True)
 
-# Add feature by feature so we can attach custom popup HTML
+# Add a few basemap options
+folium.TileLayer('CartoDB positron', name='Light').add_to(m)
+folium.TileLayer('Stamen Terrain', name='Terrain').add_to(m)
+folium.TileLayer('Esri.WorldImagery', name='Satellite').add_to(m)
+
+# Feature loop
 for feature in geojson["features"]:
     props = feature.get("properties", {}) or {}
     iso3 = extract_iso3(props)
     rest_obj = None
+
+    # try iso3 lookup first
     if iso3:
         rest_obj = rest_by_cca3.get(str(iso3).upper())
-    # fallback: match by ADMIN/NAME property
+
+    # fallback by administrative name
     if not rest_obj:
         geo_name = (props.get("ADMIN") or props.get("NAME") or props.get("name") or "").strip()
         if geo_name:
-            rest_obj = rest_by_name.get(geo_name.lower())
-            # partial fallback
+            rest_obj = rest_by_name_lower.get(geo_name.lower())
             if not rest_obj:
-                for nm, obj in rest_by_name.items():
+                # partial match fallback
+                for nm, obj in rest_by_name_lower.items():
                     if geo_name.lower() in nm:
                         rest_obj = obj
                         break
 
-    # build popup content
+    # display name & basic fields
     display_name = rest_obj.get("name", {}).get("common") if rest_obj else (props.get("ADMIN") or props.get("NAME") or props.get("name") or "Country")
     iso3_display = rest_obj.get("cca3") if rest_obj else (iso3 or "—")
+    capital = ", ".join(rest_obj.get("capital")) if rest_obj and rest_obj.get("capital") else "—"
+    region = rest_obj.get("region") if rest_obj else "—"
+    subregion = rest_obj.get("subregion") if rest_obj else "—"
+    population = rest_obj.get("population") if rest_obj else None
+    currencies = []
+    if rest_obj and rest_obj.get("currencies"):
+        for code, info in rest_obj["currencies"].items():
+            name = info.get("name")
+            currencies.append(f"{name} ({code})" if name else code)
+    timezones = rest_obj.get("timezones") if rest_obj else []
+
+    # languages
     languages = []
     if rest_obj and rest_obj.get("languages"):
-        languages = list(rest_obj.get("languages").values())
-    official_html = ", ".join(languages) if languages else "—"
-    wiki = "https://en.wikipedia.org/wiki/" + display_name.replace(" ", "_")
-    popup_html = f"<div style='font-family:Arial,Helvetica,sans-serif; font-size:13px;'><b>{display_name}</b><br><b>Official:</b> {official_html}<br><b>ISO3:</b> {iso3_display}<br><a href='{wiki}' target='_blank' rel='noopener'>Wikipedia</a></div>"
+        languages = list(rest_obj["languages"].values())
 
+    # flags
+    flag_png = None
+    if rest_obj and rest_obj.get("flags"):
+        # restcountries exposes flags {png, svg}
+        flag_png = rest_obj["flags"].get("png") or rest_obj["flags"].get("svg")
+
+    # geometry analytics: area, centroid, bounds
+    geom = feature.get("geometry")
+    area_sqkm = "—"
+    centroid_lat = centroid_lon = "—"
+    bbox_str = "—"
+    try:
+        poly = shape(geom)
+        # compute centroid lat/lon (in degrees)
+        centroid = poly.centroid
+        centroid_lon = round(centroid.x, 6)
+        centroid_lat = round(centroid.y, 6)
+        bounds = poly.bounds  # (minx, miny, maxx, maxy)
+        bbox_str = bbox_to_string(bounds)
+
+        # project to equal-area and compute area
+        try:
+            projected = shapely_transform(transformer.transform, poly)
+            area_m2 = projected.area
+            area_sqkm = round(area_m2 / 1e6, 2)
+        except Exception:
+            # fallback: compute geodesic approx via WebMercator if transform fails
+            fallback_transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+            proj2 = shapely_transform(fallback_transformer.transform, poly)
+            area_m2 = proj2.area
+            area_sqkm = round(area_m2 / 1e6, 2)
+    except Exception as e:
+        # keep defaults
+        area_sqkm = "—"
+        centroid_lat = centroid_lon = "—"
+        bbox_str = "—"
+
+    # build popup HTML (compact and readable)
+    languages_html = ", ".join(languages) if languages else "—"
+    currencies_html = ", ".join(currencies) if currencies else "—"
+    timezones_html = ", ".join(timezones) if timezones else "—"
+    population_html = fmt_num(population) if population else "—"
+
+    popup_html = f"""
+    <div style="font-family: Arial, Helvetica, sans-serif; font-size:13px; max-width:320px;">
+      <div style="display:flex; gap:8px; align-items:center;">
+        <div style="flex:1;">
+          <b style="font-size:15px;">{display_name}</b><br/>
+          <small style="color:#666">ISO3: {iso3_display}</small>
+        </div>
+        <div style="width:72px; text-align:right;">
+          {"<img src='"+flag_png+"' width='60' style='border-radius:4px;'/>" if flag_png else ""}
+        </div>
+      </div>
+      <hr style="margin:6px 0"/>
+      <div><strong>Capital:</strong> {capital}</div>
+      <div><strong>Region:</strong> {region} / {subregion}</div>
+      <div><strong>Population:</strong> {population_html}</div>
+      <div><strong>Currencies:</strong> {currencies_html}</div>
+      <div><strong>Timezones:</strong> {timezones_html}</div>
+      <div style="margin-top:6px;"><strong>Official languages:</strong> {languages_html}</div>
+      <hr style="margin:6px 0"/>
+      <div><strong>Area (sq.km):</strong> {safe_str(area_sqkm)}</div>
+      <div><strong>Centroid (lat,lon):</strong> {centroid_lat}, {centroid_lon}</div>
+      <div><strong>Bounding box:</strong> {bbox_str}</div>
+      <div style="margin-top:6px;"><a href="https://en.wikipedia.org/wiki/{display_name.replace(' ','_')}" target="_blank">Wikipedia</a></div>
+    </div>
+    """
+
+    # add feature with popup
     gj = folium.GeoJson(
         feature,
         style_function=lambda feat, stroke="#2b4a90", fill="#eaf2ff": {
             "color": stroke,
             "weight": 0.6,
             "fillColor": fill,
-            "fillOpacity": 0.85
-        }
+            "fillOpacity": 0.85,
+        },
+        highlight_function=lambda feat: {"weight": 1.8, "color": "#0b3d91", "fillOpacity": 0.95}
     )
-    gj.add_child(folium.Popup(popup_html, max_width=320))
+    gj.add_child(folium.Popup(popup_html, max_width=360))
     gj.add_to(m)
 
-# Render the map HTML using folium's internal renderer and embed in Streamlit
-map_html = m.get_root().render()
-components.v1.html(map_html, height=720, scrolling=True)
+# Add layer control
+folium.LayerControl(position='topright').add_to(m)
 
-# Optional: side info (static)
-st.sidebar.markdown("---")
-st.sidebar.markdown("Tip: click a country polygon on the map. Data sources: REST Countries • Natural Earth GeoJSON.")
+# render and embed
+map_html = m.get_root().render()
+components.v1.html(map_html, height=760, scrolling=True)
+
+# small footer
+st.markdown("---")
+st.markdown(f"Note: area computed by projecting to {used_crs} (equal-area preference). Values are approximate.")
